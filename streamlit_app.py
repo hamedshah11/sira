@@ -1,19 +1,19 @@
 import os, json
 from typing import List
+
 import pandas as pd
 import streamlit as st
 
-# ============ CONFIG =============
+# ================= CONFIG =================
 DATA_FILE    = "university_requirements.csv"
 GRADE_MAP    = {"A*": 6, "A": 5, "B": 4, "C": 3, "D": 2, "E": 1}
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "o3-mini")  # set in Secrets
-# =================================
+# ==========================================
 
-# ---------- DATA LOADER ----------
+# ---------- DATA LOADER with cache-bust ----------
 @st.cache_data
 def _load_data(path: str, _mtime: float) -> pd.DataFrame:
     df = pd.read_csv(path)
-    # normalise programme names (strip brackets, lower-case)
     df["Programme_norm"] = (
         df["Major/Programme"]
           .str.strip()
@@ -23,23 +23,23 @@ def _load_data(path: str, _mtime: float) -> pd.DataFrame:
     return df
 
 def get_data(path: str = DATA_FILE) -> pd.DataFrame:
-    mtime = os.path.getmtime(path)          # cache key
+    mtime = os.path.getmtime(path)    # forces reload when file changes
     return _load_data(path, mtime)
-# ----------------------------------
+# -------------------------------------------------
 
-# ---------- RULES ENGINE ----------
+# ---------- DETERMINISTIC ENGINE -----------------
 def parse_grades(txt: str) -> List[str]:
     txt = txt.upper().replace(" ", "")
     out, i = [], 0
     while i < len(txt):
-        if txt[i] == "A" and i + 1 < len(txt) and txt[i + 1] == "*":
+        if txt[i] == "A" and i + 1 < len(txt) and txt[i+1] == "*":
             out.append("A*"); i += 2
         else:
             out.append(txt[i]); i += 1
     return out
 
-def numeric(gr: List[str]) -> List[int]:
-    return sorted([GRADE_MAP.get(g, 0) for g in gr], reverse=True)
+def numeric(gs: List[str]) -> List[int]:
+    return sorted([GRADE_MAP.get(g, 0) for g in gs], reverse=True)
 
 def tag(student: str, band: str) -> str:
     if not band:
@@ -53,29 +53,29 @@ def tag(student: str, band: str) -> str:
 
 def chance(student: str, band: str) -> str:
     if not band: return "—"
-    s_avg = sum(numeric(parse_grades(student))) / 3
-    b_avg = sum(numeric(parse_grades(band))) / 3
-    p = 0.60 + 0.10 * (s_avg - b_avg)
-    p = max(0.10, min(0.90, p))
+    sa = sum(numeric(parse_grades(student)))/3
+    ba = sum(numeric(parse_grades(band)))/3
+    p  = 0.60 + 0.10 * (sa - ba)
+    p  = max(0.10, min(0.90, p))
     return f"{int(p*100)}%"
-# ----------------------------------
+# -------------------------------------------------
 
-# ---------- LLM WRAPPER ----------
+# ---------- LLM HELPER ---------------------------
 def llm(prompt: str) -> str:
     import openai
     key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
     if not key:
         return "⚠️ OpenAI key missing."
     openai.api_key = key
-    resp = openai.chat.completions.create(
+    rsp = openai.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        max_completion_tokens=350   # correct for o-series
+        max_completion_tokens=350           # o-series syntax
     )
-    return resp.choices[0].message.content.strip()
-# ----------------------------------
+    return rsp.choices[0].message.content.strip()
+# -------------------------------------------------
 
-# ---------- UI HELPERS ------------
+# ---------- UI HELPERS ---------------------------
 def colour(cat):
     return {"Safety":"background-color:#d4edda",
             "Match":"background-color:#fff3cd",
@@ -88,9 +88,9 @@ def kpis(df):
     b.metric("Safety 🎯", len(df[df.Category=="Safety"]))
     c.metric("Match ⚖️", len(df[df.Category=="Match"]))
     d.metric("Reach 🚀", len(df[df.Category=="Reach"]))
-# ----------------------------------
+# -------------------------------------------------
 
-# -------------- APP ---------------
+# ---------------- STREAMLIT APP ------------------
 def main():
     st.set_page_config("Uni Screener","🎓")
     st.title("🎓 University Admission Screener")
@@ -104,7 +104,7 @@ def main():
 
     if st.button("🔍 Show matches") and grades:
         subset = data[data["Programme_norm"] == major_norm]
-        if subset.empty():
+        if subset.empty:                     # ✅ fixed: property, not function
             st.warning("No programmes found."); st.stop()
 
         rows = []
@@ -126,7 +126,7 @@ def main():
                  .sort_values("Category", key=lambda s: s.map(order)))
 
         kpis(out)
-        st.dataframe(out.style.applymap(colour, subset=["Category"]).hide(axis="index"),
+        st.dataframe(out.style.applymap(colour,subset=["Category"]).hide(axis="index"),
                      use_container_width=True)
 
         st.download_button("📥 Download CSV",
