@@ -1,159 +1,144 @@
-import os, json
+import os, json, time
 import pandas as pd
 import streamlit as st
 from typing import List
 
-# ---------- CONFIG ------------------------------------------------------------------
+# ------------------- CONFIG -------------------------------------------------
 DATA_FILE     = "university_requirements.csv"
 GRADE_MAP     = {"A*": 6, "A": 5, "B": 4, "C": 3, "D": 2, "E": 1}
-OPENAI_MODEL  = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # override via Streamlit Secrets
-# ------------------------------------------------------------------------------------
+OPENAI_MODEL  = os.getenv("OPENAI_MODEL", "o3-mini")   # set in Secrets
+# ----------------------------------------------------------------------------
 
 @st.cache_data
 def load_data(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
-# -------------------------- DETERMINISTIC ENGINE ------------------------------------
-def parse_grade_string(text: str) -> List[str]:
-    """Tokenise grade string, preserving A*."""
-    text = text.upper().replace(" ", "")
+# ------------------- DETERMINISTIC ENGINE -----------------------------------
+def parse_grade(text: str) -> List[str]:
+    t = text.upper().replace(" ", "")
     out, i = [], 0
-    while i < len(text):
-        if text[i] == "A" and i + 1 < len(text) and text[i + 1] == "*":
+    while i < len(t):
+        if t[i] == "A" and i + 1 < len(t) and t[i + 1] == "*":
             out.append("A*"); i += 2
         else:
-            out.append(text[i]); i += 1
+            out.append(t[i]); i += 1
     return out
 
 def numeric_list(grades: List[str]) -> List[int]:
     return sorted([GRADE_MAP.get(g, 0) for g in grades], reverse=True)
 
-def compare_lists(student, band):
-    for s, b in zip(student, band):
-        if s > b: return 1
-        if s < b: return -1
+def compare(a, b):
+    for s, r in zip(a, b):
+        if s > r: return 1
+        if s < r: return -1
     return 0
 
-def tag_category(student_raw: str, band_raw: str) -> str:
-    if not band_raw:
-        return "N/A"
-    s = numeric_list(parse_grade_string(student_raw))
-    b = numeric_list(parse_grade_string(band_raw))
-    s += [0] * (len(b) - len(s))
-    b += [0] * (len(s) - len(b))
-    cmp = compare_lists(s, b)
+def tag(student: str, band: str) -> str:
+    if not band: return "N/A"
+    s = numeric_list(parse_grade(student))
+    r = numeric_list(parse_grade(band))
+    s += [0] * (len(r) - len(s));  r += [0] * (len(s) - len(r))
+    cmp = compare(s, r)
     return "Safety" if cmp == 1 else "Match" if cmp == 0 else "Reach"
 
-# -------------------------- OPTIONAL CHANCE HEURISTIC --------------------------------
-def probability_estimate(student_raw: str, band_raw: str) -> float:
-    """Rough chance (grade-only). 0.10–0.90 range."""
-    if not band_raw: return 0.0
-    s = numeric_list(parse_grade_string(student_raw))
-    b = numeric_list(parse_grade_string(band_raw))
-    avg_s = sum(s) / len(s)
-    avg_b = sum(b) / len(b)
-    if avg_s >= avg_b:
-        return min(0.90, 0.60 + (avg_s - avg_b) * 0.10)
-    return max(0.10, 0.60 - (avg_b - avg_s) * 0.15)
+def chance(student: str, band: str) -> str:
+    if not band: return "—"
+    s = numeric_list(parse_grade(student)); r = numeric_list(parse_grade(band))
+    p = 0.6 + 0.1 * (sum(s)/len(s) - sum(r)/len(r))
+    p = max(0.10, min(0.90, p))
+    return f"{int(p*100)}%"
 
-# ------------------------------ LLM HELPER -------------------------------------------
-def llm_advice(prompt: str) -> str:
+# ------------------- LLM HELPER ---------------------------------------------
+def llm(prompt: str) -> str:
     try:
         import openai
     except ImportError:
-        return "⚠️ `openai` package not installed."
+        return "⚠️ `openai` lib missing."
     key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
-    if not key:
-        return "⚠️ OpenAI API key not set (add in Streamlit ► Secrets)."
+    if not key: return "⚠️ No API key."
     openai.api_key = key
     resp = openai.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=350,
+        temperature=0.3, max_tokens=350,
     )
     return resp.choices[0].message.content.strip()
 
-# ----------------------------- UI HELPERS --------------------------------------------
-def color_category(val):
-    return {
-        "Safety": "background-color:#d4edda",   # green
-        "Match":  "background-color:#fff3cd",   # yellow
-        "Reach":  "background-color:#f8d7da",   # red
-        "N/A":    "background-color:#f8f9fa",   # grey
-    }.get(val, "")
+# ------------------- UI HELPERS ---------------------------------------------
+def colour(val):
+    return {"Safety":"background-color:#d4edda",
+            "Match":"background-color:#fff3cd",
+            "Reach":"background-color:#f8d7da",
+            "N/A":"background-color:#f8f9fa"}.get(val,"")
 
-def show_kpis(df: pd.DataFrame):
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total",   len(df))
-    col2.metric("Safety 🎯", len(df[df["Category"] == "Safety"]))
-    col3.metric("Match ⚖️", len(df[df["Category"] == "Match"]))
-    col4.metric("Reach 🚀", len(df[df["Category"] == "Reach"]))
+def kpis(df):
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Total", len(df))
+    c2.metric("Safety🎯", len(df[df["Category"]=="Safety"]))
+    c3.metric("Match⚖️", len(df[df["Category"]=="Match"]))
+    c4.metric("Reach🚀", len(df[df["Category"]=="Reach"]))
 
-# -------------------------------- STREAMLIT APP -------------------------------------
+# ------------------- APP -----------------------------------------------------
 def main():
-    st.set_page_config(page_title="University Screener", page_icon="🎓")
+    st.set_page_config("Uni Screener","🎓")
     st.title("🎓 University Admission Screener")
-    st.caption("Deterministic Safety / Match / Reach tags + GPT-4o-mini advice")
 
-    df = load_data(DATA_FILE)
+    data = load_data(DATA_FILE)
 
-    col1, col2 = st.columns(2)
-    grades = col1.text_input("Your A-level grades", placeholder="A*A B  /  AAA")
-    major  = col2.text_input("Desired major keyword", placeholder="Computer Science")
+    # === INPUTS ===
+    grades = st.text_input("Your A-level grades", placeholder="A*A B / ABB")
 
-    if st.button("🔍  Search") and grades and major:
-        subset = df[df["Major/Programme"].str.contains(major, case=False, na=False)]
+    majors = sorted(data["Major/Programme"].dropna().unique())
+    # selectbox refreshes UI automatically (normal Streamlit behaviour). :contentReference[oaicite:0]{index=0}
+    major = st.selectbox("Select a major / programme", majors, index=0)
+
+    # === PROCESS ===
+    if st.button("🔍  Show matches") and grades:
+        subset = data[data["Major/Programme"] == major]
         if subset.empty:
-            st.warning("No matching programmes found."); st.stop()
+            st.warning("No entries for that major."); st.stop()
 
         rows = []
         for _, r in subset.iterrows():
             try:
-                band = json.loads(r["Requirements (A-level)"]).get("overall_band", "")
+                band = json.loads(r["Requirements (A-level)"]).get("overall_band","")
             except Exception:
                 band = ""
             rows.append({
                 "University": r["University"],
                 "Programme":  r["Major/Programme"],
                 "Band":       band,
-                "Category":   tag_category(grades, band),
-                "Chance":     f"{int(probability_estimate(grades, band)*100)}%"
+                "Category":   tag(grades, band),
+                "Chance":     chance(grades, band)
             })
+        order = {"Safety":0,"Match":1,"Reach":2,"N/A":3}
+        df_out = (pd.DataFrame(rows)
+                    .sort_values("Category", key=lambda s: s.map(order)))
 
-        order   = {"Safety": 0, "Match": 1, "Reach": 2, "N/A": 3}
-        results = (pd.DataFrame(rows)
-                   .sort_values("Category", key=lambda s: s.map(order)))
-
-        # KPIs, table, CSV
-        show_kpis(results)
-        styled = (results
-                  .style
-                  .applymap(color_category, subset=["Category"])
-                  .hide(axis="index"))
+        # === DISPLAY ===
+        kpis(df_out)
+        styled = (df_out.style.applymap(colour, subset=["Category"])
+                            .hide(axis="index"))
         st.dataframe(styled, use_container_width=True)
 
-        csv = results.to_csv(index=False)
-        st.download_button("📥 Download CSV", csv,
-                           file_name="university_matches.csv",
-                           mime="text/csv")
+        st.download_button("📥 Download CSV",
+                           df_out.to_csv(index=False),
+                           "university_matches.csv",
+                           "text/csv")
 
-        if st.checkbox("🧠 LLM advice (GPT-4o-mini)"):
-            bullet = "\n".join(
-                f"[{r['Category']}] {r['University']} – {r['Programme']} (needs {r['Band']})"
-                for _, r in results.iterrows()
-            )
-            prompt = (
-                f'Student grades: "{grades}"  |  Major keyword: "{major}"\n{bullet}\n\n'
-                "For each programme:\n"
-                "• Confirm whether the tag is fair.\n"
-                "• Explain the key gap in one sentence.\n"
-                "• Give one actionable tip to improve chances.\n"
-                "Return a concise markdown list."
-            )
-            with st.spinner("Consulting the LLM…"):
-                st.markdown("### Personalised guidance")
-                st.markdown(llm_advice(prompt))
+        # === LLM ADVICE (automatic) ===
+        bullets = "\n".join(
+            f"[{row.Category}] {row.University} – {row.Programme} (needs {row.Band})"
+            for row in df_out.itertuples()
+        )
+        prompt = (
+            f'Grades: "{grades}" | Major: "{major}"\n{bullets}\n\n'
+            "Explain briefly why each tag is fair and give one improvement tip."
+        )
+        with st.spinner("Consulting the LLM…"):          # built-in spinner :contentReference[oaicite:1]{index=1}
+            advice = llm(prompt)
+        st.markdown("### 🤖 LLM Advice")
+        st.markdown(advice)
 
 if __name__ == "__main__":
     main()
