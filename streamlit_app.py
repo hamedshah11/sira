@@ -1,108 +1,90 @@
+"""
+streamlit_app.py — o3-mini compliant
+"""
 import os, json, pandas as pd, streamlit as st
 from typing import List
+from openai import OpenAI
 
 # ---------------- CONFIG -----------------
-CSV_PATH      = "university_requirements.csv"
-GRADE_MAP     = {"A*":6,"A":5,"B":4,"C":3,"D":2,"E":1}
-OPENAI_MODEL  = os.getenv("OPENAI_MODEL", "o3-mini")   # set in “Secrets”
-MAX_TOKENS    = 350                                    # keep short
+CSV   = "university_requirements.csv"
+MODEL = os.getenv("OPENAI_MODEL", "o3-mini")   # set in Streamlit ► Secrets
+MAX_TOK = 350
+client = OpenAI()
+
+GRADE = {"A*":6,"A":5,"B":4,"C":3,"D":2,"E":1}
 # -----------------------------------------
 
-# ------- CSV LOADER with cache-bust -------
 @st.cache_data
-def _load(path: str, mtime: float):
+def load_df(path, mtime):          # cache busts on file update
     df = pd.read_csv(path)
-    df["Programme_norm"] = (df["Major/Programme"]
-        .str.strip().str.lower().str.replace(r"\s*\(.*\)", "", regex=True))
+    df["prog_norm"] = (df["Major/Programme"]
+                       .str.strip().str.lower()
+                       .str.replace(r"\s*\(.*\)","",regex=True))
     return df
 
-def data():
-    return _load(CSV_PATH, os.path.getmtime(CSV_PATH))
-# -----------------------------------------
+def get_df():
+    return load_df(CSV, os.path.getmtime(CSV))
 
-# ------- GRADE → TAG ENGINE ---------------
-def parse(gr):                        # keep A* token intact
-    t = gr.upper().replace(" ", ""); i=0; out=[]
-    while i < len(t):
-        out.append("A*" if t[i:i+2]=="A*" else t[i])
-        i += 2 if t[i:i+2]=="A*" else 1
+# ---------- deterministic tag ----------
+def parse(s):                      # keep A*
+    s=s.upper().replace(" ",""); i=0; out=[]
+    while i<len(s):
+        out.append("A*" if s[i:i+2]=="A*" else s[i])
+        i+=2 if s[i:i+2]=="A*" else 1
     return out
 
-def nums(ls): return sorted([GRADE_MAP.get(g,0) for g in ls], reverse=True)
+def num(lst): return sorted([GRADE.get(x,0) for x in lst], reverse=True)
 
-def tag(student, band):
-    if not band: return "N/A"
-    s, b = nums(parse(student)), nums(parse(band))
-    s += [0]*(len(b)-len(s)); b += [0]*(len(s)-len(b))
-    for a,r in zip(s,b):
-        if a>r: return "Safety"
-        if a<r: return "Reach"
+def tag(gr,b):
+    if not b: return "N/A"
+    a,b = num(parse(gr)),num(parse(b))
+    a+=[0]*(len(b)-len(a)); b+=[0]*(len(a)-len(b))
+    for s,r in zip(a,b):
+        if s>r: return "Safety"
+        if s<r: return "Reach"
     return "Match"
-# -----------------------------------------
+# ---------------------------------------
 
-# ---------- OPENAI CALL -------------------
-def ask_openai(prompt: str) -> str:
-    import openai
-    key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY","")
-    if not key: raise RuntimeError("No OpenAI key.")
-    openai.api_key = key
-
-    rsp = openai.chat.completions.create(
-        model             = OPENAI_MODEL,
-        messages          = [{"role":"user","content": prompt}],
-        max_completion_tokens = MAX_TOKENS              # ✔ o-series
+def ask_llm(prompt:str)->str:
+    rsp = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role":"user","content":prompt}],
+        max_completion_tokens=MAX_TOK
     )
-
-    # show raw JSON for debugging
-    with st.sidebar.expander("🔍 Raw LLM response", expanded=False):
+    # debug payload in sidebar
+    with st.sidebar.expander("🔍 Raw LLM"):
         st.write(rsp)
+    if rsp.choices and rsp.choices[0].message:
+        return rsp.choices[0].message.content.strip()
+    return "⚠️ empty completion"
 
-    if not rsp.choices or not rsp.choices[0].message:
-        return ""
-    return rsp.choices[0].message.content.strip()
-# ------------------------------------------
-
+# -------------- Streamlit UI -----------
 def main():
     st.set_page_config("Uni Screener","🎓")
     st.title("🎓 University Admission Screener")
 
-    df   = data()
-    grad = st.text_input("Your A-level grades", "A*A B")
-    majors = sorted(df["Programme_norm"].unique())
-    major = st.selectbox("Programme", majors, index=0)
+    df   = get_df()
+    grad = st.text_input("Your A-level grades","A*A B")
+    major = st.selectbox("Programme",sorted(df.prog_norm.unique()))
 
     if st.button("Search") and grad:
-        sub = df[df["Programme_norm"] == major]
-        if sub.empty:
-            st.warning("No programmes"); st.stop()
-
         rows=[]
-        for _, r in sub.iterrows():
-            try: band = json.loads(r["Requirements (A-level)"]).get("overall_band","")
-            except: band = ""
-            rows.append({
-                "University": r["University"],
-                "Programme":  r["Major/Programme"],
-                "Band":       band,
-                "Category":   tag(grad, band)
-            })
-
+        for _,r in df[df.prog_norm==major].iterrows():
+            band = json.loads(r["Requirements (A-level)"]).get("overall_band","")
+            rows.append({"University":r["University"],
+                         "Programme": r["Major/Programme"],
+                         "Band": band,
+                         "Category": tag(grad,band)})
         out = pd.DataFrame(rows)
-        st.dataframe(out, use_container_width=True)
+        st.dataframe(out,use_container_width=True)
 
         bullets = "\n".join(f"[{c}] {u} – {p} (needs {b})"
                             for u,p,b,c in out[["University","Programme","Band","Category"]]
                             .itertuples(index=False))
-        prompt = (f'Grades: "{grad}" | Major: "{major}"\n{bullets}\n'
-                  "Explain each tag in one line and suggest an improvement tip.")
-        with st.spinner("GPT thinking…"):
-            ans = ask_openai(prompt)
-
-        if ans:
-            st.markdown("### 🤖 GPT advice")
-            st.markdown(ans)
-        else:
-            st.error("LLM returned empty content. Inspect sidebar for raw JSON.")
+        prompt = (f'Grades: \"{grad}\" | Major: \"{major}\"\n{bullets}\n'
+                  "Explain tags in one sentence & give 1 tip each.")
+        with st.spinner("GPT…"):
+            st.markdown(ask_llm(prompt))
 
 if __name__ == "__main__":
     main()
