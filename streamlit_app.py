@@ -4,16 +4,17 @@ from typing import List
 import pandas as pd
 import streamlit as st
 
-# ================= CONFIG =================
+# ============ CONFIG =============
 DATA_FILE    = "university_requirements.csv"
 GRADE_MAP    = {"A*": 6, "A": 5, "B": 4, "C": 3, "D": 2, "E": 1}
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "o3-mini")  # set in Secrets
-# ==========================================
+# =================================
 
-# ---------- DATA LOADER with cache-bust ----------
+# ---------- DATA LOADER ----------
 @st.cache_data
 def _load_data(path: str, _mtime: float) -> pd.DataFrame:
     df = pd.read_csv(path)
+    # normalise programme names
     df["Programme_norm"] = (
         df["Major/Programme"]
           .str.strip()
@@ -23,11 +24,11 @@ def _load_data(path: str, _mtime: float) -> pd.DataFrame:
     return df
 
 def get_data(path: str = DATA_FILE) -> pd.DataFrame:
-    mtime = os.path.getmtime(path)    # forces reload when file changes
+    mtime = os.path.getmtime(path)            # cache key
     return _load_data(path, mtime)
-# -------------------------------------------------
+# ----------------------------------
 
-# ---------- DETERMINISTIC ENGINE -----------------
+# ---------- RULES ENGINE ----------
 def parse_grades(txt: str) -> List[str]:
     txt = txt.upper().replace(" ", "")
     out, i = [], 0
@@ -58,14 +59,14 @@ def chance(student: str, band: str) -> str:
     p  = 0.60 + 0.10 * (sa - ba)
     p  = max(0.10, min(0.90, p))
     return f"{int(p*100)}%"
-# -------------------------------------------------
+# ----------------------------------
 
-# ---------- LLM HELPER ---------------------------
+# ---------- LLM HELPER ------------
 def llm(prompt: str) -> str:
     import openai
     key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
     if not key:
-        return "⚠️ OpenAI key missing."
+        raise RuntimeError("OpenAI key missing in Secrets.")
     openai.api_key = key
     rsp = openai.chat.completions.create(
         model=OPENAI_MODEL,
@@ -73,9 +74,9 @@ def llm(prompt: str) -> str:
         max_completion_tokens=350           # o-series syntax
     )
     return rsp.choices[0].message.content.strip()
-# -------------------------------------------------
+# ----------------------------------
 
-# ---------- UI HELPERS ---------------------------
+# ---------- UI HELPERS ------------
 def colour(cat):
     return {"Safety":"background-color:#d4edda",
             "Match":"background-color:#fff3cd",
@@ -88,9 +89,9 @@ def kpis(df):
     b.metric("Safety 🎯", len(df[df.Category=="Safety"]))
     c.metric("Match ⚖️", len(df[df.Category=="Match"]))
     d.metric("Reach 🚀", len(df[df.Category=="Reach"]))
-# -------------------------------------------------
+# ----------------------------------
 
-# ---------------- STREAMLIT APP ------------------
+# -------------- APP ---------------
 def main():
     st.set_page_config("Uni Screener","🎓")
     st.title("🎓 University Admission Screener")
@@ -104,7 +105,7 @@ def main():
 
     if st.button("🔍 Show matches") and grades:
         subset = data[data["Programme_norm"] == major_norm]
-        if subset.empty:                     # ✅ fixed: property, not function
+        if subset.empty:                     # property, not function
             st.warning("No programmes found."); st.stop()
 
         rows = []
@@ -126,8 +127,10 @@ def main():
                  .sort_values("Category", key=lambda s: s.map(order)))
 
         kpis(out)
-        st.dataframe(out.style.applymap(colour,subset=["Category"]).hide(axis="index"),
-                     use_container_width=True)
+        st.dataframe(
+            out.style.map(colour, subset=["Category"]).hide(axis="index"),   # Styler.map
+            use_container_width=True
+        )
 
         st.download_button("📥 Download CSV",
                            out.to_csv(index=False),
@@ -142,9 +145,12 @@ def main():
             "Explain briefly why each tag is fair and give one improvement tip."
         )
         with st.spinner("Consulting GPT…"):
-            advice = llm(prompt)
-        st.markdown("### 🤖 LLM Advice")
-        st.markdown(advice)
+            try:
+                advice = llm(prompt)
+                st.markdown("### 🤖 LLM Advice")
+                st.markdown(advice or "_LLM returned empty response._")
+            except Exception as e:
+                st.error(f"LLM call failed: {e}")
 
 if __name__ == "__main__":
     main()
