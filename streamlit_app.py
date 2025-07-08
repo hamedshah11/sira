@@ -7,7 +7,7 @@ import streamlit as st
 # ============ CONFIG =============
 DATA_FILE    = "university_requirements.csv"
 GRADE_MAP    = {"A*": 6, "A": 5, "B": 4, "C": 3, "D": 2, "E": 1}
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "4o-mini")  # set in Secrets
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "o4-mini-2025-04-16")  # set in Secrets
 # =================================
 
 # ---------- DATA LOADER ----------
