@@ -1,108 +1,108 @@
-import os, json
-import pandas as pd
-import streamlit as st
+import os, json, pandas as pd, streamlit as st
 from typing import List
 
-# ---------------- CONFIG ----------------
-DATA_FILE    = "university_requirements.csv"
-GRADE_MAP    = {"A*":6,"A":5,"B":4,"C":3,"D":2,"E":1}
-OPENAI_MODEL = os.getenv("OPENAI_MODEL","o3-mini")
-# ----------------------------------------
+# ---------------- CONFIG -----------------
+CSV_PATH      = "university_requirements.csv"
+GRADE_MAP     = {"A*":6,"A":5,"B":4,"C":3,"D":2,"E":1}
+OPENAI_MODEL  = os.getenv("OPENAI_MODEL", "o3-mini")   # set in “Secrets”
+MAX_TOKENS    = 350                                    # keep short
+# -----------------------------------------
 
-# ---------- DATA LOADER (cache-bust) ----
+# ------- CSV LOADER with cache-bust -------
 @st.cache_data
-def _load_data(path: str, _mtime: float):
+def _load(path: str, mtime: float):
     df = pd.read_csv(path)
     df["Programme_norm"] = (df["Major/Programme"]
-        .str.strip()
-        .str.lower()
-        .str.replace(r"\s*\(.*\)","",regex=True))
+        .str.strip().str.lower().str.replace(r"\s*\(.*\)", "", regex=True))
     return df
 
-def get_data():
-    mtime = os.path.getmtime(DATA_FILE)
-    return _load_data(DATA_FILE, mtime)
-# ----------------------------------------
+def data():
+    return _load(CSV_PATH, os.path.getmtime(CSV_PATH))
+# -----------------------------------------
 
-# ---------- RULES ENGINE ---------------
-def parse_grades(txt:str)->List[str]:
-    txt = txt.upper().replace(" ","")
-    i,out=0,[]
-    while i<len(txt):
-        if txt[i]=="A" and i+1<len(txt) and txt[i+1]=="*":
-            out.append("A*"); i+=2
-        else:
-            out.append(txt[i]); i+=1
+# ------- GRADE → TAG ENGINE ---------------
+def parse(gr):                        # keep A* token intact
+    t = gr.upper().replace(" ", ""); i=0; out=[]
+    while i < len(t):
+        out.append("A*" if t[i:i+2]=="A*" else t[i])
+        i += 2 if t[i:i+2]=="A*" else 1
     return out
 
-def numeric(gs): return sorted([GRADE_MAP.get(g,0) for g in gs],reverse=True)
+def nums(ls): return sorted([GRADE_MAP.get(g,0) for g in ls], reverse=True)
 
-def tag(stu,band):
+def tag(student, band):
     if not band: return "N/A"
-    s,n = numeric(parse_grades(stu)),numeric(parse_grades(band))
-    s+= [0]*(len(n)-len(s)); n+= [0]*(len(s)-len(n))
-    for a,b in zip(s,n):
-        if a>b: return "Safety"
-        if a<b: return "Reach"
+    s, b = nums(parse(student)), nums(parse(band))
+    s += [0]*(len(b)-len(s)); b += [0]*(len(s)-len(b))
+    for a,r in zip(s,b):
+        if a>r: return "Safety"
+        if a<r: return "Reach"
     return "Match"
-# ---------------------------------------
+# -----------------------------------------
 
-# ---------- LLM HELPER with RAW JSON ----
-def llm(prompt:str)->str:
-    import openai, textwrap
+# ---------- OPENAI CALL -------------------
+def ask_openai(prompt: str) -> str:
+    import openai
     key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY","")
-    if not key: raise RuntimeError("Add OPENAI_API_KEY to Secrets.")
+    if not key: raise RuntimeError("No OpenAI key.")
     openai.api_key = key
-    response = openai.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role":"user","content":prompt}],
-        max_completion_tokens=350
+
+    rsp = openai.chat.completions.create(
+        model             = OPENAI_MODEL,
+        messages          = [{"role":"user","content": prompt}],
+        max_completion_tokens = MAX_TOKENS              # ✔ o-series
     )
 
-    # Dump raw JSON in sidebar
-    st.sidebar.expander("🔍 Raw LLM response").write(response)
+    # show raw JSON for debugging
+    with st.sidebar.expander("🔍 Raw LLM response", expanded=False):
+        st.write(rsp)
 
-    if not response.choices or not response.choices[0].message:
+    if not rsp.choices or not rsp.choices[0].message:
         return ""
-    return response.choices[0].message.content.strip()
-# ----------------------------------------
+    return rsp.choices[0].message.content.strip()
+# ------------------------------------------
 
 def main():
     st.set_page_config("Uni Screener","🎓")
     st.title("🎓 University Admission Screener")
 
-    df  = get_data()
-    grd = st.text_input("Your A-level grades","A*A B")
+    df   = data()
+    grad = st.text_input("Your A-level grades", "A*A B")
     majors = sorted(df["Programme_norm"].unique())
-    maj = st.selectbox("Programme",majors,index=0)
+    major = st.selectbox("Programme", majors, index=0)
 
-    if st.button("Search") and grd:
-        sub = df[df["Programme_norm"]==maj]
+    if st.button("Search") and grad:
+        sub = df[df["Programme_norm"] == major]
         if sub.empty:
-            st.warning("None found"); st.stop()
-        r=[]
-        for _,row in sub.iterrows():
-            band = ""
-            try: band = json.loads(row["Requirements (A-level)"]).get("overall_band","")
-            except: pass
-            r.append({"University":row["University"],
-                      "Programme":row["Major/Programme"],
-                      "Band":band,
-                      "Category":tag(grd,band)})
-        out = pd.DataFrame(r)
-        st.dataframe(out,use_container_width=True)
+            st.warning("No programmes"); st.stop()
 
-        bullets="\n".join(f"[{c}] {u} – {p} (needs {b})"
-                          for u,p,b,c in out[["University","Programme","Band","Category"]].itertuples(index=False))
-        prompt=(f'Grades: "{grd}" | Major: "{maj}"\n{bullets}\n'
-                "Explain tags and give tips.")
-        with st.spinner("GPT…"):
-            txt = llm(prompt)
-        if txt:
-            st.markdown("### GPT Advice")
-            st.markdown(txt or "_Empty completion_")
+        rows=[]
+        for _, r in sub.iterrows():
+            try: band = json.loads(r["Requirements (A-level)"]).get("overall_band","")
+            except: band = ""
+            rows.append({
+                "University": r["University"],
+                "Programme":  r["Major/Programme"],
+                "Band":       band,
+                "Category":   tag(grad, band)
+            })
+
+        out = pd.DataFrame(rows)
+        st.dataframe(out, use_container_width=True)
+
+        bullets = "\n".join(f"[{c}] {u} – {p} (needs {b})"
+                            for u,p,b,c in out[["University","Programme","Band","Category"]]
+                            .itertuples(index=False))
+        prompt = (f'Grades: "{grad}" | Major: "{major}"\n{bullets}\n'
+                  "Explain each tag in one line and suggest an improvement tip.")
+        with st.spinner("GPT thinking…"):
+            ans = ask_openai(prompt)
+
+        if ans:
+            st.markdown("### 🤖 GPT advice")
+            st.markdown(ans)
         else:
-            st.error("LLM returned empty response — check sidebar for raw JSON.")
+            st.error("LLM returned empty content. Inspect sidebar for raw JSON.")
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
