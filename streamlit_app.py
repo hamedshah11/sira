@@ -1,42 +1,46 @@
-# streamlit_app.py  –  Works with o3-mini (and o4-mini)  — 2025-07-09
-# ---------------------------------------------------------------
-# A-level “Safety / Match / Reach” screener with GPT advice pane.
-# ---------------------------------------------------------------
+# streamlit_app.py — University Admission Screener • 2025-07-10
+# --------------------------------------------------------------
+# Works with o3-mini (and o4-mini).  Per-programme GPT advice,
+# improved %-Match, tabbed UI, badges, progress bars, expanders.
+# --------------------------------------------------------------
 
-import os
-import json
-import pandas as pd
-import streamlit as st
-from typing import List
+import os, json, re, pandas as pd, streamlit as st
+from typing import List, Dict
 from openai import OpenAI
 
-# ---------- CONFIG -------------------------------------------------
-CSV_FILE   = "university_requirements.csv"
-MODEL_NAME = os.getenv("OPENAI_MODEL", "o3-mini")      # set in Streamlit ▶ Secrets
-MAX_COMP   = 1500                                      # plenty of visible output
-client     = OpenAI()
-GRADE_VAL  = {"A*": 6, "A": 5, "B": 4, "C": 3, "D": 2, "E": 1}
-# -------------------------------------------------------------------
+# ───────────────────────────────── CONFIG ──────────────────────────
+CSV_FILE   = "university_requirements.csv"          # your data file
+MODEL_NAME = os.getenv("OPENAI_MODEL", "o3-mini")   # set in Secrets
+MAX_COMP   = 1200                                   # generous allowance
+MAX_ROWS_FOR_GPT = 25                               # cap rows per GPT call
+GRADE_POINTS = { "A*":56, "A":48, "B":40, "C":32, "D":24, "E":16 }
 
-# ---------- DATA ---------------------------------------------------
+client = OpenAI()
+# ───────────────────────────────────────────────────────────────────
+
+
+# ──────────────── DATA LOAD & BASIC NORMALISATION ─────────────────
 @st.cache_data
-def _load(path: str, mtime: float):
-    """Load CSV and normalise programme names once; cached until file changes."""
+def _load(path: str, mtime: float) -> pd.DataFrame:
     df = pd.read_csv(path)
+    # Normalised programme name for drop-down search
     df["prog_norm"] = (df["Major/Programme"]
                        .str.strip().str.lower()
                        .str.replace(r"\s*\(.*\)", "", regex=True))
+    # Optional difficulty column (1.0 = normal).  Default 1.0.
+    if "Difficulty" not in df.columns:
+        df["Difficulty"] = 1.0
     return df
 
-def df():
-    """Public accessor so we can re-use the cache wrapper above."""
+def df() -> pd.DataFrame:
     return _load(CSV_FILE, os.path.getmtime(CSV_FILE))
-# -------------------------------------------------------------------
+# ───────────────────────────────────────────────────────────────────
 
-# ---------- GRADE HELPERS -----------------------------------------
-def tokenise(s: str) -> List[str]:
-    """Split a grade string like 'A*A B' into ['A*','A','B'] ignoring spaces."""
-    s = s.upper().replace(" ", "")
+
+# ────────────────────── GRADE UTILS & % MATCH ─────────────────────
+def tokenise(gr: str) -> List[str]:
+    """Split 'A*A B' → ['A*','A','B']"""
+    s = gr.upper().replace(" ", "")
     out, i = [], 0
     while i < len(s):
         if s[i:i+2] == "A*":
@@ -45,146 +49,188 @@ def tokenise(s: str) -> List[str]:
             out.append(s[i]); i += 1
     return out
 
-def numeric(lst: List[str]) -> List[int]:
-    """Map grades to numbers and sort high→low so we can compare."""
-    return sorted([GRADE_VAL.get(g, 0) for g in lst], reverse=True)
+def top_n_points(grades: List[str], n: int) -> int:
+    pts = sorted([GRADE_POINTS.get(g, 0) for g in grades], reverse=True)
+    return sum(pts[:n])
 
-def tag(student: str, band: str) -> str:
-    """Return Safety / Match / Reach / N/A for one programme band."""
+def percent_match(student: str, band: str, difficulty: float) -> float:
     if not band:
-        return "N/A"
-    s, b = numeric(tokenise(student)), numeric(tokenise(band))
-    s += [0]*(len(b)-len(s))   # pad to equal length
-    b += [0]*(len(s)-len(b))
-    for a, r in zip(s, b):
-        if a > r:
-            return "Safety"
-        if a < r:
-            return "Reach"
-    return "Match"
+        return 0.0
+    stu = tokenise(student)
+    req = tokenise(band)
+    student_pts   = top_n_points(stu, len(req))
+    required_pts  = sum(GRADE_POINTS.get(g, 0) for g in req) * difficulty
+    return round(100 * student_pts / required_pts, 1) if required_pts else 0.0
 
-def pct_match(student: str, band: str) -> str:
-    """% match of first 3 grades vs band (simple average)."""
-    if not band:
-        return "—"
-    s_val = sum(numeric(tokenise(student))[:3]) / 3
-    b_val = sum(numeric(tokenise(band))[:3]) / 3
-    pct   = round(100 * s_val / b_val, 1) if b_val else 0
-    return f"{pct} %"
-# -------------------------------------------------------------------
+def category_from_pct(pct: float) -> str:
+    if pct >= 110:
+        return "Safety"
+    if pct >= 95:
+        return "Match"
+    return "Reach"
+# ───────────────────────────────────────────────────────────────────
 
-# ---------- OPENAI CALL (o3-mini-friendly) ------------------------
-def gpt(prompt: str) -> str:
-    key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
-    if not key:
-        raise RuntimeError("Add OPENAI_API_KEY to Streamlit ▶ Secrets.")
-    client.api_key = key
+
+# ────────────────────── GPT CALL (PER-ROW TIPS) ───────────────────
+def gpt_batch_advice(rows: List[Dict]) -> Dict[int, str]:
+    """
+    rows – list of dicts with keys: idx, University, Programme, Category, pct
+    Returns dict {idx: advice}.
+    """
+    if not rows:
+        return {}
+    # Build a compact, index-prefixed prompt so we can map advice back.
+    bullet_lines = [
+        f"{r['idx']} | {r['University']} | {r['Programme']} | "
+        f"{r['Category']} | {r['pct']}%"
+        for r in rows
+    ]
+    prompt = (
+        "You are an admissions advisor. For EACH line below, give ONE concise "
+        "tip (max 18 words) that can improve the student's chance for THAT "
+        "programme. Reply with the same number of lines, each starting with "
+        "the numeric id, a pipe, then the tip.\n\n" +
+        "\n".join(bullet_lines)
+    )
 
     rsp = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
-            {
-                "role": "system",
-                "content":
-                    "You are a helpful university admissions assistant. "
-                    "For each programme listed, explain in ONE concise line "
-                    "why it is classified as Safety, Match or Reach based on "
-                    "the student's A-level grades, then offer ONE actionable "
-                    "improvement tip."
-            },
-            {"role": "user", "content": prompt}
+            {"role":"system",
+             "content":"Return tips in the format 'id | tip'. No extra text."},
+            {"role":"user","content":prompt}
         ],
-        max_completion_tokens=MAX_COMP,   # mandatory for o-series
-        reasoning_effort="low"            # leaves more visible tokens
+        max_completion_tokens=MAX_COMP,
+        reasoning_effort="medium"
     )
+    raw = rsp.choices[0].message.content.strip()
+    # Parse lines like "3 | Strengthen personal statement focusing on leadership."
+    advice = {}
+    for line in raw.splitlines():
+        m = re.match(r"(\d+)\s*\|\s*(.+)", line.strip())
+        if m:
+            advice[int(m.group(1))] = m.group(2).strip()
+    return advice
+# ───────────────────────────────────────────────────────────────────
 
-    # Optional: peek at the raw response for debugging.
-    with st.sidebar.expander("🔍 Raw LLM response"):
-        st.write(rsp)
 
-    return (rsp.choices[0].message.content or "").strip()
-# -------------------------------------------------------------------
-
-# ---------- UI HELPERS --------------------------------------------
+# ─────────────────────────── UI HELPERS ───────────────────────────
 def colour(cat):
-    """Background colour for dataframe styling."""
     return {
-        "Safety": "background-color:#d4edda",   # green
-        "Match":  "background-color:#fff3cd",   # yellow
-        "Reach":  "background-color:#f8d7da",   # red
-        "N/A":    "background-color:#f8f9fa"    # light gray
-    }.get(cat, "")
+        "Safety":"#d4edda",
+        "Match":"#fff3cd",
+        "Reach":"#f8d7da"
+    }.get(cat, "#f8f9fa")
 
-def kpis(df):
-    """Show quick metrics across the top."""
-    a, b, c, d = st.columns(4)
-    a.metric("Total",     len(df))
-    b.metric("Safety 🎯", len(df[df.Category == "Safety"]))
-    c.metric("Match ⚖️",  len(df[df.Category == "Match"]))
-    d.metric("Reach 🚀",  len(df[df.Category == "Reach"]))
-# -------------------------------------------------------------------
+def badge(cat):
+    if cat=="Safety":
+        return st.badge("Safety",  icon=":material/check_circle:",  color="green")
+    if cat=="Match":
+        return st.badge("Match",   icon=":material/balance:",       color="orange")
+    return st.badge("Reach",      icon=":material/rocket_launch:", color="red")
 
-# ================= STREAMLIT APP ==================================
+def kpis(df_cat):
+    s, m, r = (len(df_cat[df_cat.Category == c]) for c in ["Safety","Match","Reach"])
+    a,b,c = st.columns(3)
+    a.metric("Safety ✅", s)
+    b.metric("Match 🎯",  m)
+    c.metric("Reach 🚀",  r)
+# ───────────────────────────────────────────────────────────────────
+
+
+# ──────────────────────── MAIN STREAMLIT APP ──────────────────────
 def main():
     st.set_page_config("Uni Screener", "🎓")
     st.title("🎓 University Admission Screener")
 
     table  = df()
-    grades = st.text_input("Your A-level grades", "A*A B")
+    grades = st.text_input("Your A-level grades (e.g. A*A B)", "A*A B")
     major  = st.selectbox("Programme / Major", sorted(table.prog_norm.unique()))
 
-    if st.button("🔍 Search") and grades:
-        sub = table[table.prog_norm == major]
-        if sub.empty:
-            st.warning("No programmes match that keyword.")
+    if st.button("🔍 Search") and grades.strip():
+        subset = table[table.prog_norm == major]
+        if subset.empty:
+            st.warning("No programmes found for that keyword.")
             st.stop()
 
-        # Build results table
+        # Build result rows with new %-Match & category.
         rows = []
-        for _, r in sub.iterrows():
-            band = ""
+        for i, row in subset.iterrows():
+            band       = ""
             try:
-                band = json.loads(r["Requirements (A-level)"]).get("overall_band", "")
+                band = json.loads(row["Requirements (A-level)"]).get("overall_band", "")
             except Exception:
                 pass
+            pct   = percent_match(grades, band, row["Difficulty"])
+            cat   = category_from_pct(pct) if band else "N/A"
             rows.append({
-                "University": r["University"],
-                "Programme":  r["Major/Programme"],
+                "idx":        i,  # original dataframe index for mapping tips
+                "University": row["University"],
+                "Programme":  row["Major/Programme"],
                 "Band":       band,
-                "Category":   tag(grades, band),
-                "% Match":    pct_match(grades, band)
+                "pct":        pct,
+                "Category":   cat
             })
 
-        out = pd.DataFrame(rows)
-        # Sort Safety first, then Match, Reach, N/A
-        out = out.sort_values("Category",
-                              key=lambda s: s.map({"Safety":0, "Match":1,
-                                                   "Reach":2, "N/A":3}))
-        kpis(out)
-        st.dataframe(
-            out.style.map(colour, subset=["Category"]).hide(axis="index"),
-            use_container_width=True
+        # Sort Safety > Match > Reach > N/A then by % desc.
+        order = {"Safety":0,"Match":1,"Reach":2,"N/A":3}
+        rows.sort(key=lambda r:(order.get(r["Category"],99), -r["pct"]))
+
+        # Ask GPT for advice on at most MAX_ROWS_FOR_GPT rows.
+        advice_map = gpt_batch_advice(rows[:MAX_ROWS_FOR_GPT])
+
+        # Convert to DataFrame for easy filtering / KPI.
+        res_df = pd.DataFrame(rows)
+        kpis(res_df)
+
+        # Build tabs
+        safety_tab, match_tab, reach_tab, na_tab = st.tabs(
+            ["✅ Safety", "🎯 Match", "🚀 Reach", "ℹ️ N/A"]
         )
+        tab_map = {
+            "Safety": safety_tab,
+            "Match":  match_tab,
+            "Reach":  reach_tab,
+            "N/A":    na_tab
+        }
 
-        st.download_button("📥 Download CSV", out.to_csv(index=False),
-                           "uni_matches.csv", "text/csv")
+        # Display rows inside their category tab
+        for cat in ["Safety","Match","Reach","N/A"]:
+            with tab_map[cat]:
+                cat_rows = res_df[res_df.Category == cat]
+                if cat_rows.empty():
+                    st.info("No programmes in this category.")
+                    continue
+                for _, r in cat_rows.iterrows():
+                    bg = colour(cat)
+                    with st.container():
+                        st.markdown(f"""<div style="background-color:{bg};padding:8px;border-radius:6px">""",
+                                    unsafe_allow_html=True)
+                        title = f"**{r.University} – {r.Programme}**"
+                        st.markdown(title)
+                        badge(cat)
 
-        # GPT prompt: bullet list of programmes with tags
-        bullets = "\n".join(f"[{c}] {u} – {p} (needs {b})"
-                            for u, p, b, c in
-                            out[["University", "Programme", "Band", "Category"]]
-                            .itertuples(index=False))
-        prompt = (f'Grades: "{grades}" | Major: "{major}"\n{bullets}\n'
-                  "Explain each tag in one line and give one improvement tip.")
+                        # % Match progress bar
+                        pct_int = int(max(0,min(r.pct, 200)))  # clamp 0-200
+                        st.progress(pct_int, text=f"{r.pct}% Match")
 
-        with st.spinner("GPT is thinking…"):
-            advice = gpt(prompt)
+                        # Advice (if available)
+                        tip = advice_map.get(r.idx, "— no tip generated (row beyond GPT limit) —")
+                        with st.expander("💬 Advice"):
+                            st.write(tip)
+                            st.write(f"*Band required:* `{r.Band or 'N/A'}`")
 
-        if advice:
-            st.markdown("### 🤖 GPT Advice")
-            st.markdown(advice)
-        else:
-            st.error("LLM returned empty text — see sidebar for details.")
+                        st.markdown("</div>", unsafe_allow_html=True)
+                        st.write("")  # spacer
+
+        # Export whole table
+        if st.download_button("📥 Download CSV", res_df.drop(columns=["idx"]).to_csv(index=False),
+                              "uni_matches.csv", "text/csv"):
+            st.success("CSV downloaded!")
 
 if __name__ == "__main__":
-    main()
+    # Make sure the OpenAI key is set
+    if "OPENAI_API_KEY" not in st.secrets:
+        st.error("Please add OPENAI_API_KEY to Streamlit › Secrets.")
+    else:
+        main()
