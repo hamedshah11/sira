@@ -1,104 +1,165 @@
-# streamlit_app.py  —  fixed progress-bar clamp  •  2025-07-10
-# (unchanged sections are collapsed with comments ─────────────)
+# streamlit_app.py — University Admission Screener • 2025-07-10
+# -------------------------------------------------------------
+# Works with o3-mini (and o4-mini).  Per-programme GPT advice,
+# improved %-Match, tabbed UI, badges, progress bars, expanders.
+# -------------------------------------------------------------
 
 import os, json, re, pandas as pd, streamlit as st
 from typing import List, Dict
 from openai import OpenAI
 
-# ───────────────────────── CONFIG (unchanged) ──────────────────────────
-CSV_FILE, MODEL_NAME, MAX_COMP, MAX_ROWS_FOR_GPT = (
-    "university_requirements.csv", os.getenv("OPENAI_MODEL", "o3-mini"), 1200, 25
-)
-GRADE_POINTS = {"A*": 56, "A": 48, "B": 40, "C": 32, "D": 24, "E": 16}
+# ───────────────────────── CONFIG ──────────────────────────
+CSV_FILE   = "university_requirements.csv"
+MODEL_NAME = os.getenv("OPENAI_MODEL", "o3-mini")      # set in Secrets
+MAX_COMP   = 1200                                      # GPT completion room
+MAX_ROWS_FOR_GPT = 25                                  # cap rows sent to GPT
+GRADE_POINTS = {"A*":56, "A":48, "B":40, "C":32, "D":24, "E":16}
+
 client = OpenAI()
-# ───────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────
 
-# … all helper functions for loading CSV, grade utilities,
-#   GPT batch advice, badges, KPIs stay exactly the same …
 
-# ───────────────────────── MAIN APP ──────────────────────────
+# ────────────── LOAD CSV (cached) ──────────────
+@st.cache_data
+def _load(path: str, mtime: float) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df["prog_norm"] = (df["Major/Programme"]
+                       .str.strip().str.lower()
+                       .str.replace(r"\s*\(.*\)", "", regex=True))
+    if "Difficulty" not in df.columns:               # optional column
+        df["Difficulty"] = 1.0
+    return df
+
+def df() -> pd.DataFrame:
+    return _load(CSV_FILE, os.path.getmtime(CSV_FILE))
+# ──────────────────────────────────────────────
+
+
+# ───────────── GRADE UTILITIES ────────────────
+def tokenise(gr: str) -> List[str]:
+    s = gr.upper().replace(" ", "")
+    out, i = [], 0
+    while i < len(s):
+        if s[i:i+2] == "A*": out.append("A*"); i += 2
+        else: out.append(s[i]); i += 1
+    return out
+
+def top_n_points(grades: List[str], n: int) -> int:
+    pts = sorted([GRADE_POINTS.get(g,0) for g in grades], reverse=True)
+    return sum(pts[:n])
+
+def percent_match(student: str, band: str, diff: float) -> float:
+    if not band: return 0.0
+    stu, req = tokenise(student), tokenise(band)
+    stu_pts  = top_n_points(stu, len(req))
+    req_pts  = sum(GRADE_POINTS.get(g,0) for g in req) * diff
+    return round(100 * stu_pts / req_pts, 1) if req_pts else 0.0
+
+def category_from_pct(p: float) -> str:
+    if p >= 110: return "Safety"
+    if p >= 95:  return "Match"
+    return "Reach"
+# ──────────────────────────────────────────────
+
+
+# ───── GPT batch tips (returns dict {idx: tip}) ─────
+def gpt_batch_advice(rows: List[Dict]) -> Dict[int,str]:
+    if not rows: return {}
+    lines = [f"{r['idx']} | {r['University']} | {r['Programme']} | "
+             f"{r['Category']} | {r['pct']}%" for r in rows]
+    prompt = ("You are an admissions advisor. For EACH line, give ONE concise "
+              "tip (≤18 words) that can improve the student's chance. "
+              "Return same number of lines, each 'id | tip'.\n\n"+ "\n".join(lines))
+    rsp = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[{"role":"system","content":"Return tips as 'id | tip' only."},
+                  {"role":"user","content":prompt}],
+        max_completion_tokens=MAX_COMP,
+        reasoning_effort="low")
+    raw = rsp.choices[0].message.content.strip()
+    advice={}
+    for ln in raw.splitlines():
+        m = re.match(r"(\d+)\s*\|\s*(.+)", ln.strip())
+        if m: advice[int(m.group(1))]=m.group(2).strip()
+    return advice
+# ──────────────────────────────────────────────
+
+
+# ─────────────── UI helpers ────────────────
+def colour(cat:str)->str:
+    return {"Safety":"#d4edda","Match":"#fff3cd","Reach":"#f8d7da"}.get(cat,"#f8f9fa")
+
+def badge(cat:str):
+    if cat=="Safety": return st.badge("Safety", icon=":material/check_circle:",  color="green")
+    if cat=="Match":  return st.badge("Match",  icon=":material/balance:",       color="orange")
+    return st.badge("Reach", icon=":material/rocket_launch:", color="red")
+
+def kpis(df_cat: pd.DataFrame):
+    s,m,r=(len(df_cat[df_cat.Category==c]) for c in["Safety","Match","Reach"])
+    a,b,c=st.columns(3); a.metric("Safety ✅",s); b.metric("Match 🎯",m); c.metric("Reach 🚀",r)
+# ────────────────────────────────────────────
+
+
+# ─────────────── MAIN APP ────────────────
 def main():
-    st.set_page_config("Uni Screener", "🎓")
+    st.set_page_config("Uni Screener","🎓")
     st.title("🎓 University Admission Screener")
 
-    table  = df()
-    grades = st.text_input("Your A-level grades (e.g. A*A B)", "A*A B")
-    major  = st.selectbox("Programme / Major", sorted(table.prog_norm.unique()))
+    table=df()
+    grades=st.text_input("Your A-level grades (e.g. A*A B)","A*A B")
+    major=st.selectbox("Programme / Major",sorted(table.prog_norm.unique()))
 
     if st.button("🔍 Search") and grades.strip():
-        subset = table[table.prog_norm == major]
+        subset=table[table.prog_norm==major]
         if subset.empty:
-            st.warning("No programmes found for that keyword.")
-            st.stop()
+            st.warning("No programmes found."); st.stop()
 
-        # Build rows (same as before) …
-        rows = []
-        for i, row in subset.iterrows():
-            try:
-                band = json.loads(row["Requirements (A-level)"]).get("overall_band", "")
-            except Exception:
-                band = ""
-            pct = percent_match(grades, band, row["Difficulty"])
-            cat = category_from_pct(pct) if band else "N/A"
-            rows.append(
-                dict(idx=i, University=row["University"], Programme=row["Major/Programme"],
-                     Band=band, pct=pct, Category=cat)
-            )
+        rows=[]
+        for i,row in subset.iterrows():
+            try: band=json.loads(row["Requirements (A-level)"]).get("overall_band","")
+            except Exception: band=""
+            pct=percent_match(grades,band,row["Difficulty"])
+            cat=category_from_pct(pct) if band else "N/A"
+            rows.append(dict(idx=i,University=row["University"],
+                             Programme=row["Major/Programme"],Band=band,
+                             pct=pct,Category=cat))
 
-        order = {"Safety": 0, "Match": 1, "Reach": 2, "N/A": 3}
-        rows.sort(key=lambda r: (order.get(r["Category"], 99), -r["pct"]))
-        advice_map = gpt_batch_advice(rows[:MAX_ROWS_FOR_GPT])
-        res_df = pd.DataFrame(rows)
+        rows.sort(key=lambda r:({"Safety":0,"Match":1,"Reach":2,"N/A":3}.get(r["Category"],99),
+                                 -r["pct"]))
+        advice=gpt_batch_advice(rows[:MAX_ROWS_FOR_GPT])
+        res_df=pd.DataFrame(rows)
         kpis(res_df)
 
-        safety_tab, match_tab, reach_tab, na_tab = st.tabs(
-            ["✅ Safety", "🎯 Match", "🚀 Reach", "ℹ️ N/A"]
-        )
-        tab_map = {"Safety": safety_tab, "Match": match_tab,
-                   "Reach": reach_tab, "N/A": na_tab}
+        safety_tab,match_tab,reach_tab,na_tab=st.tabs(
+            ["✅ Safety","🎯 Match","🚀 Reach","ℹ️ N/A"])
+        tabs={"Safety":safety_tab,"Match":match_tab,"Reach":reach_tab,"N/A":na_tab}
 
-        for cat in ["Safety", "Match", "Reach", "N/A"]:
-            with tab_map[cat]:
-                cat_rows = res_df[res_df.Category == cat]
+        for cat in ["Safety","Match","Reach","N/A"]:
+            with tabs[cat]:
+                cat_rows=res_df[res_df.Category==cat]
                 if cat_rows.empty:
-                    st.info("No programmes in this category.")
-                    continue
-
-                for _, r in cat_rows.iterrows():
-                    bg = colour(cat)
+                    st.info("No programmes in this category."); continue
+                for _,r in cat_rows.iterrows():
+                    bg=colour(cat)
                     with st.container():
-                        st.markdown(  # coloured card
-                            f'<div style="background-color:{bg};padding:8px;border-radius:6px">',
-                            unsafe_allow_html=True
-                        )
+                        st.markdown(f'<div style="background-color:{bg};'
+                                    'padding:8px;border-radius:6px">',unsafe_allow_html=True)
                         st.markdown(f"**{r.University} – {r.Programme}**")
                         badge(cat)
-
-                        # ─── FIX: normalise to 0-1 and clamp ───
-                        progress_val = max(0.0, min(r.pct / 100.0, 1.0))
+                        progress_val=max(0.0,min(r.pct/100.0,1.0))   # 0-1 float clamp
                         st.progress(progress_val, text=f"{r.pct}% Match")
-                        # ───────────────────────────────────────
-
-                        tip = advice_map.get(
-                            r.idx,
-                            "— no tip generated (row beyond GPT limit) —"
-                        )
+                        tip=advice.get(r.idx,"— no tip generated (row beyond GPT limit) —")
                         with st.expander("💬 Advice"):
                             st.write(tip)
                             st.write(f"*Band required:* `{r.Band or 'N/A'}`")
+                        st.markdown("</div>",unsafe_allow_html=True); st.write("")
 
-                        st.markdown("</div>", unsafe_allow_html=True)
-                        st.write("")  # spacer
+        st.download_button("📥 Download CSV",
+                           res_df.drop(columns=["idx"]).to_csv(index=False),
+                           "uni_matches.csv","text/csv")
 
-        st.download_button(
-            "📥 Download CSV",
-            res_df.drop(columns=["idx"]).to_csv(index=False),
-            "uni_matches.csv",
-            "text/csv"
-        )
-
-if __name__ == "__main__":
+if __name__=="__main__":
     if "OPENAI_API_KEY" not in st.secrets:
-        st.error("Please add OPENAI_API_KEY to Streamlit › Secrets.")
+        st.error("Add OPENAI_API_KEY to Streamlit › Secrets.")
     else:
         main()
