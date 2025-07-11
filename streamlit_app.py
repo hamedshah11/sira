@@ -13,7 +13,7 @@ if "step" not in st.session_state:
 @st.cache_data
 def load_data():
     # Load the dataset (adjust filename as needed)
-    return pd.read_csv("programmes.csv")
+    return pd.read_csv("university_requirements.csv")
 
 try:
     df = load_data()
