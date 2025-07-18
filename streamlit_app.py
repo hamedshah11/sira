@@ -1,217 +1,279 @@
-"""
-streamlit_app.py — University Admission Screener (Wizard Edition v2.1)
-====================================================================
-* Fully functional four‑step wizard
-* Fixes previous KeyError and syntax errors
-* Works with Streamlit ≥ 1.32, Python ≥ 3.9
+# streamlit_app.py ─ holistic screener with GPA & per-row GPT comments
+# Tested with: streamlit ≥ 1.32 • openai ≥ 1.25 • o3-mini model.
 
-Run with:
-```bash
-streamlit run streamlit_app.py
-```
-"""
-
-from __future__ import annotations
-import os, json, re, datetime
+import os, json, re
+from pathlib import Path
 from typing import List, Dict, Optional
 
 import pandas as pd
 import streamlit as st
+from openai import OpenAI
 
-# OpenAI (optional) -------------------------------------------------------------
-try:
-    from openai import OpenAI
-    _client: Optional[OpenAI] = OpenAI()
-except Exception:
-    _client = None  # GPT comments will fall back
-
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
-MAX_GPT_TOKENS = 600
-
-# -----------------------------------------------------------------------------
-CSV_FILE = "university_requirements.csv"  # make sure this file exists
+# ───────────────────────── CONFIG ─────────────────────────
+CSV_FILE   = "university_requirements.csv"           # dataset
+MODEL_NAME = os.getenv("OPENAI_MODEL", "o3-mini")    # override in Secrets if needed
+MAX_COMP   = 1_200                                   # GPT token budget
+MAX_ROWS_FOR_GPT = 25                                # rows sent for comments
 GRADE_POINTS = {"A*": 56, "A": 48, "B": 40, "C": 32, "D": 24, "E": 16}
 
-# ----------------------- DATA LOAD & NORMALISE -------------------------------
+# Initialise OpenAI client (expects OPENAI_API_KEY in secrets or env var)
+client = OpenAI()
+
+# ──────────────────────────────────────────────────────────
+# ▸ DATA LOAD & NORMALISE
 @st.cache_data(show_spinner=False)
 def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
-    # Normalised programme name (lower‑case, strip parentheses)
+
+    # Normalised programme name (lower-case, no brackets)
     df["prog_norm"] = (
-        df["Major/Programme"].astype(str).str.strip().str.lower()
+        df["Major/Programme"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
         .str.replace(r"\s*\(.*\)", "", regex=True)
     )
-    # GPA requirement numeric column
+
+    # GPA column may be missing in the raw file
     if "GPA" not in df.columns:
         df["GPA"] = "N/A"
 
-    def parse_req_gpa(cell: str) -> float:
+    # Parse required GPA (stored as JSON in the GPA column)
+    def parse_req_gpa(cell) -> Optional[float]:
         try:
-            return float(json.loads(cell).get("minimum", "nan"))
+            obj = json.loads(cell)
+            val = obj.get("minimum")
+            return float(val) if val not in (None, "", "N/A") else float("nan")
         except Exception:
             return float("nan")
 
     df["Req_GPA"] = df["GPA"].apply(parse_req_gpa)
+
+    # Difficulty (multiplier) defaults to 1.0 if absent
     if "Difficulty" not in df.columns:
         df["Difficulty"] = 1.0
+
     return df
 
-TABLE = load_data(CSV_FILE)
 
-# ----------------------- HELPER FUNCTIONS ------------------------------------
+table = load_data(CSV_FILE)
 
-def _tokenise(s: str) -> List[str]:
-    s = s.upper().replace(" ", "")
+# ──────────────────────────────────────────────────────────
+# ▸ GRADE HELPERS & CATEGORIES
+def tokenise(txt: str) -> List[str]:
+    """Split a grade string like 'A*A B' ⇒ ['A*', 'A', 'B']"""
+    s = txt.upper().replace(" ", "")
     out, i = [], 0
     while i < len(s):
         if s[i : i + 2] == "A*":
-            out.append("A*"); i += 2
+            out.append("A*")
+            i += 2
         else:
-            out.append(s[i]); i += 1
+            out.append(s[i])
+            i += 1
     return out
 
 
-def _points(gs: List[str]) -> int:
-    return sum(GRADE_POINTS.get(g, 0) for g in gs)
+def top_n_points(gs: List[str], n: int) -> int:
+    pts = sorted((GRADE_POINTS.get(g, 0) for g in gs), reverse=True)
+    return sum(pts[:n])
 
 
-def percent_match(stu: str, band: str, diff: float) -> float:
-    if not band or band.strip().upper() in {"-", "N/A", ""}:
+def percent_match(student: str, band: str, diff: float) -> float:
+    """Return %-match of a student's top grades vs the requirement band."""
+    if not band or str(band).strip() in ("-", "N/A"):
         return 0.0
-    req_gr = _tokenise(band)
-    if not req_gr:
-        return 0.0
-    stu_pts = _points(sorted(_tokenise(stu), key=GRADE_POINTS.get, reverse=True)[: len(req_gr)])
-    req_pts = _points(req_gr) * diff
-    return round(100 * stu_pts / req_pts, 1) if req_pts else 0.0
+    stu_pts = top_n_points(tokenise(student), len(tokenise(band)))
+    req_pts = sum(GRADE_POINTS.get(g, 0) for g in tokenise(band)) * diff
+    return round(100.0 * stu_pts / req_pts, 1) if req_pts else 0.0
 
 
-def category_from_pct(p: float | None) -> str:
-    if p is None:
-        return "N/A"
+def category_from_pct(p: float) -> str:
     if p >= 110:
         return "Safety"
     if p >= 95:
         return "Match"
     return "Reach"
 
-# ----------------------- GPT COMMENT (optional) ------------------------------
 
+# ──────────────────────────────────────────────────────────
+# ▸ GPT-BASED ONE-LINE COMMENTS
 def gpt_batch_comment(rows: List[Dict]) -> Dict[int, str]:
-    if not rows or _client is None or not os.getenv("OPENAI_API_KEY"):
-        return {r["idx"]: "GPT unavailable." for r in rows}
+    """Ask GPT for a <20-word factual comparison line for each row id."""
+    if not rows:
+        return {}
 
-    prompt_lines = [
-        f"{r['idx']} | grades {r['grades']} vs {r['Band']} | GPA {r['stu_gpa']} vs {r['req_gpa']}"
+    bullets = [
+        (
+            f"{r['idx']} | {r['University']} | {r['Programme']} | "
+            f"Student {r['grades']} GPA {r['stu_gpa']:.2f} | "
+            f"Req {r['Band']} "
+            f"GPA {r['req_gpa'] if not pd.isna(r['req_gpa']) else '—'}"
+        )
         for r in rows
     ]
+
     prompt = (
-        "Return id | ≤20‑word factual comparison of student vs programme requirements.\n\n"
-        + "\n".join(prompt_lines)
+        "For EACH line, write ONE factual comparison (<20 words) of the student's "
+        "grades & GPA vs the programme requirements. No advice. "
+        "Return exactly: id | comment.\n\n"
+        + "\n".join(bullets)
     )
-    try:
-        resp = _client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": "Return id | comment only."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=MAX_GPT_TOKENS,
-        )
-        raw = resp.choices[0].message.content.strip()
-    except Exception as e:
-        st.warning(f"GPT error: {e}")
-        return {r["idx"]: "GPT error." for r in rows}
+
+    rsp = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "Return id | comment only."},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=MAX_COMP,          # renamed in v1 API
+        temperature=0.0,              # deterministic, factual
+    )
 
     out: Dict[int, str] = {}
-    for ln in raw.splitlines():
+    for ln in rsp.choices[0].message.content.strip().splitlines():
         m = re.match(r"(\d+)\s*\|\s*(.+)", ln)
         if m:
             out[int(m.group(1))] = m.group(2).strip()
-    for r in rows:
-        out.setdefault(r["idx"], "—")
     return out
 
-# ----------------------- UI HELPERS -----------------------------------------
 
-def colour(cat):
-    return {"Safety": "#d4edda", "Match": "#fff3cd", "Reach": "#f8d7da", "N/A": "#f0f0f0"}[cat]
+# ──────────────────────────────────────────────────────────
+# ▸ STREAMLIT VISUAL HELPERS
+def colour(c: str) -> str:
+    return {
+        "Safety": "#d4edda",
+        "Match": "#fff3cd",
+        "Reach": "#f8d7da",
+    }.get(c, "#f8f9fa")
 
 
-def badge(cat):
-    icon = {"Safety": "✅", "Match": "🏅", "Reach": "🚀", "N/A": "📄"}[cat]
-    col = {"Safety": "green", "Match": "orange", "Reach": "red", "N/A": "gray"}[cat]
-    st.markdown(
-        f"<span style='background:{colour(cat)};color:{col};padding:0.3em 0.7em;border-radius:6px;font-weight:600'>{icon} {cat}</span>",
-        unsafe_allow_html=True,
-    )
+def badge(c: str):
+    icon = {
+        "Safety": ":material/check_circle:",
+        "Match": ":material/balance:",
+        "Reach": ":material/rocket_launch:",
+    }[c]
+    colr = {"Safety": "green", "Match": "orange", "Reach": "red"}[c]
+    return st.badge(c, icon=icon, color=colr)
 
-# ----------------------- APP STATE INIT --------------------------------------
-for k, v in {"step": 0, "grades": "", "gpa": 0.0, "major": None}.items():
-    st.session_state.setdefault(k, v)
 
-st.set_page_config(page_title="Uni Screener", page_icon="🎓", layout="centered")
+def kpis(df: pd.DataFrame):
+    a, b, c = st.columns(3)
+    a.metric("Safety ✅", df[df.Category == "Safety"].shape[0])
+    b.metric("Match 🎯", df[df.Category == "Match"].shape[0])
+    c.metric("Reach 🚀", df[df.Category == "Reach"].shape[0])
+
+
+# ──────────────────────────────────────────────────────────
+# ▸ STREAMLIT APP
+st.set_page_config("University Screener", "🎓")
 st.title("🎓 University Admission Screener")
-st.caption(datetime.datetime.now().strftime("Build: %Y-%m-%d %H:%M:%S"))
 
-# ----------------------- STEP FUNCTIONS --------------------------------------
+stu_gr = st.text_input("Your A-level grades (e.g. A*A B)", "A*A B")
+stu_gpa = st.number_input("Your GPA (0-4 scale)", 0.0, 4.0, 3.7, 0.01)
+major = st.selectbox("Programme / Major", sorted(table.prog_norm.unique()))
 
-def step_grades():
-    st.header("Step 1 · Enter Your Academic Record")
-    with st.form("grades_form"):
-        grades = st.text_input("A‑level grades", st.session_state.grades, help="Example: A*A B")
-        gpa_val = st.number_input("GPA (0‑4)", 0.0, 4.0, float(st.session_state.gpa), 0.01)
-        if st.form_submit_button("Next ➡️"):
-            st.session_state.update(grades=grades.strip().upper(), gpa=round(float(gpa_val), 2), step=1)
+if st.button("🔍 Search") and stu_gr.strip():
+    subset = table[table.prog_norm == major]
 
-
-def step_major():
-    st.header("Step 2 · Select Programme / Major")
-    majors = sorted(TABLE["prog_norm"].unique())
-    sel = st.selectbox("Choose a major", majors, index=majors.index(st.session_state.major) if st.session_state.major in majors else 0)
-    col1, col2 = st.columns(2)
-    if col1.button("⬅️ Back"):
-        st.session_state.step = 0
-    if col2.button("Next ➡️"):
-        st.session_state.update(major=sel, step=2)
-
-
-def step_results():
-    st.header(f"Step 3 · Matches for ‘{st.session_state.major.title()}’")
-    subset = TABLE[TABLE["prog_norm"] == st.session_state.major]
     if subset.empty:
-        st.warning("No programmes found for this major.")
-        if st.button("⬅️ Back"):
-            st.session_state.step = 1
-        return
+        st.warning("No programmes found for that major.")
+        st.stop()
 
-    rows = []
-    for idx, row in subset.iterrows():
-        band_json = json.loads(row["Requirements (A-level)"]).get("overall_band", "")
+    # Build result rows
+    rows: List[Dict] = []
+    for i, row in subset.iterrows():
+        # Parse A-level band safely
+        try:
+            band_raw = json.loads(row["Requirements (A-level)"]).get("overall_band", "")
+            band = str(band_raw).strip()
+        except Exception:
+            band = ""
+
         req_gpa = row["Req_GPA"]
-        pct = percent_match(st.session_state.grades, band_json, row["Difficulty"]) if band_json else None
-        if (not band_json) and not pd.isna(req_gpa) and req_gpa > 0:
-            pct = round(st.session_state.gpa / req_gpa * 100, 1)
-        cat = category_from_pct(pct)
-        rows.append({
-            "idx": idx,
-            "University": row["University"],
-            "Programme": row["Major/Programme"],
-            "Band": band_json or "—",
-            "req_gpa": req_gpa,
-            "grades": st.session_state.grades,
-            "stu_gpa": st.session_state.gpa,
-            "pct": pct,
-            "Category": cat,
-        })
 
+        # 1) Match on A-level band
+        if re.search(r"[A-E]", band):
+            pct = percent_match(stu_gr, band, row["Difficulty"])
+            cat = category_from_pct(pct)
+
+        # 2) Else, fallback to GPA
+        elif not pd.isna(req_gpa) and req_gpa > 0:
+            pct = round((stu_gpa / req_gpa) * 100, 1)
+            cat = category_from_pct(pct)
+
+        # 3) No comparable requirement
+        else:
+            pct = 0.0
+            cat = "N/A"
+
+        rows.append(
+            dict(
+                idx=i,
+                grades=stu_gr,
+                stu_gpa=stu_gpa,
+                University=row["University"],
+                Programme=row["Major/Programme"],
+                Band=band if re.search(r"[A-E]", band) else "—",
+                req_gpa=req_gpa,
+                pct=pct,
+                Category=cat,
+            )
+        )
+
+    # Sort by category then descending match %
+    order = {"Safety": 0, "Match": 1, "Reach": 2, "N/A": 3}
+    rows.sort(key=lambda r: (order.get(r["Category"], 99), -r["pct"]))
+
+    # Ask GPT for <= 25 comparison comments
+    comment_map = gpt_batch_comment(rows[:MAX_ROWS_FOR_GPT])
+
+    # Convert to DataFrame for display / download
     df_res = pd.DataFrame(rows)
-    df_res["Comment"] = pd.Series(gpt_batch_comment(rows))
 
-    # KPI tiles
-    kpi_cols = st.columns(4)
-    for cat, col in zip(["Safety", "Match", "Reach", "N/A"], kpi_cols):
-        col.metric(cat, df_res[df_res.Category == cat].shape[0])
+    # KPI cards
+    kpis(df_res)
 
-    st.divider()
-    for _, r in df_res.iterrows():
+    # Category tabs
+    tab_titles = ["✅ Safety", "🎯 Match", "🚀 Reach", "ℹ️ N/A"]
+    tabs = st.tabs(tab_titles)
+    tab_map = dict(zip(["Safety", "Match", "Reach", "N/A"], tabs))
+
+    for cat in ["Safety", "Match", "Reach", "N/A"]:
+        with tab_map[cat]:
+            cat_rows = df_res[df_res.Category == cat]
+            if cat_rows.empty:
+                st.info("No programmes in this category.")
+                continue
+
+            for _, r in cat_rows.iterrows():
+                with st.container():
+                    st.markdown(
+                        f'<div style="background-color:{colour(cat)};padding:8px;border-radius:6px">',
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(f"**{r.University} – {r.Programme}**")
+                    badge(cat)
+
+                    bar = max(0.0, min(r.pct / 100.0, 1.0))
+                    st.progress(
+                        bar,
+                        text=f"{r.pct}% match • GPA req "
+                        f"{'—' if pd.isna(r.req_gpa) else r.req_gpa}",
+                    )
+
+                    with st.expander("💬 GPT comparison"):
+                        st.write(comment_map.get(r.idx, "— no comment —"))
+
+                    st.markdown("</div>", unsafe_allow_html=True)
+                    st.write("")
+
+    st.download_button(
+        "📥 Download CSV",
+        df_res.drop(columns=["idx"]).to_csv(index=False),
+        file_name="uni_matches.csv",
+        mime="text/csv",
+    )
+else:
+    st.info("Enter your grades & GPA, choose a major, then click **Search**.")
