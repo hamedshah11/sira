@@ -1,7 +1,9 @@
-# streamlit_app.py ─ holistic screener with GPA & per-row GPT comments
+# streamlit_app.py — holistic screener with GPA & per-row GPT comments
 # Tested with: streamlit ≥ 1.32 • openai ≥ 1.25 • o3-mini model.
 
-import os, json, re
+import os
+import json
+import re
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -10,14 +12,13 @@ import streamlit as st
 from openai import OpenAI
 
 # ───────────────────────── CONFIG ─────────────────────────
-CSV_FILE   = "university_requirements.csv"           # dataset
-MODEL_NAME = os.getenv("OPENAI_MODEL", "o3-mini")    # override in Secrets if needed
-MAX_COMP   = 1_200                                   # GPT token budget
-MAX_ROWS_FOR_GPT = 25                                # rows sent for comments
+CSV_FILE = "university_requirements.csv"              # dataset
+MODEL_NAME = os.getenv("OPENAI_MODEL", "o3-mini")     # override in Secrets if needed
+MAX_COMP = 1_200                                      # tokens for each batch comment
+MAX_ROWS_FOR_GPT = 25                                 # rows sent for comments
 GRADE_POINTS = {"A*": 56, "A": 48, "B": 40, "C": 32, "D": 24, "E": 16}
 
-# Initialise OpenAI client (expects OPENAI_API_KEY in secrets or env var)
-client = OpenAI()
+client = OpenAI()  # expects OPENAI_API_KEY in environment or Streamlit secrets
 
 # ──────────────────────────────────────────────────────────
 # ▸ DATA LOAD & NORMALISE
@@ -25,7 +26,7 @@ client = OpenAI()
 def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
 
-    # Normalised programme name (lower-case, no brackets)
+    # normalised programme name (lower-case, no brackets)
     df["prog_norm"] = (
         df["Major/Programme"]
         .astype(str)
@@ -34,11 +35,11 @@ def load_data(path: str) -> pd.DataFrame:
         .str.replace(r"\s*\(.*\)", "", regex=True)
     )
 
-    # GPA column may be missing in the raw file
+    # GPA column may be missing
     if "GPA" not in df.columns:
         df["GPA"] = "N/A"
 
-    # Parse required GPA (stored as JSON in the GPA column)
+    # parse required GPA from JSON-in-cell
     def parse_req_gpa(cell) -> Optional[float]:
         try:
             obj = json.loads(cell)
@@ -49,7 +50,7 @@ def load_data(path: str) -> pd.DataFrame:
 
     df["Req_GPA"] = df["GPA"].apply(parse_req_gpa)
 
-    # Difficulty (multiplier) defaults to 1.0 if absent
+    # difficulty multiplier defaults to 1.0
     if "Difficulty" not in df.columns:
         df["Difficulty"] = 1.0
 
@@ -61,7 +62,6 @@ table = load_data(CSV_FILE)
 # ──────────────────────────────────────────────────────────
 # ▸ GRADE HELPERS & CATEGORIES
 def tokenise(txt: str) -> List[str]:
-    """Split a grade string like 'A*A B' ⇒ ['A*', 'A', 'B']"""
     s = txt.upper().replace(" ", "")
     out, i = [], 0
     while i < len(s):
@@ -80,7 +80,6 @@ def top_n_points(gs: List[str], n: int) -> int:
 
 
 def percent_match(student: str, band: str, diff: float) -> float:
-    """Return %-match of a student's top grades vs the requirement band."""
     if not band or str(band).strip() in ("-", "N/A"):
         return 0.0
     stu_pts = top_n_points(tokenise(student), len(tokenise(band)))
@@ -97,9 +96,8 @@ def category_from_pct(p: float) -> str:
 
 
 # ──────────────────────────────────────────────────────────
-# ▸ GPT-BASED ONE-LINE COMMENTS
+# ▸ GPT: one-line comparison comments
 def gpt_batch_comment(rows: List[Dict]) -> Dict[int, str]:
-    """Ask GPT for a <20-word factual comparison line for each row id."""
     if not rows:
         return {}
 
@@ -107,8 +105,8 @@ def gpt_batch_comment(rows: List[Dict]) -> Dict[int, str]:
         (
             f"{r['idx']} | {r['University']} | {r['Programme']} | "
             f"Student {r['grades']} GPA {r['stu_gpa']:.2f} | "
-            f"Req {r['Band']} "
-            f"GPA {r['req_gpa'] if not pd.isna(r['req_gpa']) else '—'}"
+            f"Req {r['Band']} GPA "
+            f"{r['req_gpa'] if not pd.isna(r['req_gpa']) else '—'}"
         )
         for r in rows
     ]
@@ -116,8 +114,7 @@ def gpt_batch_comment(rows: List[Dict]) -> Dict[int, str]:
     prompt = (
         "For EACH line, write ONE factual comparison (<20 words) of the student's "
         "grades & GPA vs the programme requirements. No advice. "
-        "Return exactly: id | comment.\n\n"
-        + "\n".join(bullets)
+        "Return exactly: id | comment.\n\n" + "\n".join(bullets)
     )
 
     rsp = client.chat.completions.create(
@@ -126,8 +123,8 @@ def gpt_batch_comment(rows: List[Dict]) -> Dict[int, str]:
             {"role": "system", "content": "Return id | comment only."},
             {"role": "user", "content": prompt},
         ],
-        max_tokens=MAX_COMP,          # renamed in v1 API
-        temperature=0.0,              # deterministic, factual
+        max_completion_tokens=MAX_COMP,   # correct param for o3 models
+        reasoning_effort="low",           # optional knob
     )
 
     out: Dict[int, str] = {}
@@ -171,7 +168,7 @@ st.set_page_config("University Screener", "🎓")
 st.title("🎓 University Admission Screener")
 
 stu_gr = st.text_input("Your A-level grades (e.g. A*A B)", "A*A B")
-stu_gpa = st.number_input("Your GPA (0-4 scale)", 0.0, 4.0, 3.7, 0.01)
+stu_gpa = st.number_input("Your GPA (0–4 scale)", 0.0, 4.0, 3.7, 0.01)
 major = st.selectbox("Programme / Major", sorted(table.prog_norm.unique()))
 
 if st.button("🔍 Search") and stu_gr.strip():
@@ -181,10 +178,9 @@ if st.button("🔍 Search") and stu_gr.strip():
         st.warning("No programmes found for that major.")
         st.stop()
 
-    # Build result rows
+    # build rows
     rows: List[Dict] = []
     for i, row in subset.iterrows():
-        # Parse A-level band safely
         try:
             band_raw = json.loads(row["Requirements (A-level)"]).get("overall_band", "")
             band = str(band_raw).strip()
@@ -193,18 +189,13 @@ if st.button("🔍 Search") and stu_gr.strip():
 
         req_gpa = row["Req_GPA"]
 
-        # 1) Match on A-level band
-        if re.search(r"[A-E]", band):
+        if re.search(r"[A-E]", band):  # band present
             pct = percent_match(stu_gr, band, row["Difficulty"])
             cat = category_from_pct(pct)
-
-        # 2) Else, fallback to GPA
-        elif not pd.isna(req_gpa) and req_gpa > 0:
+        elif not pd.isna(req_gpa) and req_gpa > 0:  # fallback to GPA
             pct = round((stu_gpa / req_gpa) * 100, 1)
             cat = category_from_pct(pct)
-
-        # 3) No comparable requirement
-        else:
+        else:  # no comparable requirement
             pct = 0.0
             cat = "N/A"
 
@@ -222,20 +213,20 @@ if st.button("🔍 Search") and stu_gr.strip():
             )
         )
 
-    # Sort by category then descending match %
+    # sort rows
     order = {"Safety": 0, "Match": 1, "Reach": 2, "N/A": 3}
     rows.sort(key=lambda r: (order.get(r["Category"], 99), -r["pct"]))
 
-    # Ask GPT for <= 25 comparison comments
+    # GPT comments (max 25 rows)
     comment_map = gpt_batch_comment(rows[:MAX_ROWS_FOR_GPT])
 
-    # Convert to DataFrame for display / download
+    # dataframe for display / download
     df_res = pd.DataFrame(rows)
 
     # KPI cards
     kpis(df_res)
 
-    # Category tabs
+    # tabs by category
     tab_titles = ["✅ Safety", "🎯 Match", "🚀 Reach", "ℹ️ N/A"]
     tabs = st.tabs(tab_titles)
     tab_map = dict(zip(["Safety", "Match", "Reach", "N/A"], tabs))
@@ -246,11 +237,11 @@ if st.button("🔍 Search") and stu_gr.strip():
             if cat_rows.empty:
                 st.info("No programmes in this category.")
                 continue
-
             for _, r in cat_rows.iterrows():
                 with st.container():
                     st.markdown(
-                        f'<div style="background-color:{colour(cat)};padding:8px;border-radius:6px">',
+                        f'<div style="background-color:{colour(cat)};'
+                        'padding:8px;border-radius:6px">',
                         unsafe_allow_html=True,
                     )
                     st.markdown(f"**{r.University} – {r.Programme}**")
