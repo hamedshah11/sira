@@ -24,13 +24,9 @@ IB_TO_GPA = {
     27: 2.4, 26: 2.3, 25: 2.2, 24: 2.1
 }
 
-# A-level to GPA conversion (approximate)
-ALEVEL_TO_GPA = {
-    "A*A*A*": 4.0, "A*A*A": 3.9, "A*AA": 3.8, "AAA": 3.7,
-    "A*AB": 3.6, "AAB": 3.5, "ABB": 3.4, "BBB": 3.3,
-    "BBC": 3.2, "BCC": 3.1, "CCC": 3.0, "CCD": 2.9,
-    "CDD": 2.8, "DDD": 2.7, "DDE": 2.6, "DEE": 2.5, "EEE": 2.4
-}
+# Grade conversion mappings
+ALEVEL_GPA_VALUES = {"A*": 4.0, "A": 4.0, "B": 3.0, "C": 2.0, "D": 1.0, "E": 0.0}
+IB_GRADE_TO_GPA = {7: 4.0, 6: 3.7, 5: 3.3, 4: 2.7, 3: 2.3, 2: 1.7, 1: 1.0}
 
 client = OpenAI()  # requires OPENAI_API_KEY in env or Streamlit secrets
 
@@ -62,46 +58,45 @@ def load_data(path: str) -> pd.DataFrame:
 table = load_data(CSV_FILE)
 
 # ─── GRADE CONVERSION FUNCTIONS ──────────────────────────────────────
-def convert_ib_to_gpa(ib_score: int) -> float:
-    """Convert IB score to GPA (4.0 scale)"""
-    if ib_score >= 45:
-        return 4.0
-    elif ib_score >= 24:
-        return IB_TO_GPA.get(ib_score, 2.4)
-    else:
-        return max(2.0, ib_score / 24 * 2.4)  # Linear scaling for very low scores
+def convert_ib_grades_to_gpa(ib_grades_str: str) -> float:
+    """Convert IB subject grades (e.g., '7,6,5,6,7,4') to GPA (4.0 scale)"""
+    try:
+        # Parse grades from string (comma-separated or space-separated)
+        grades_str = re.sub(r'[^\d,\s]', '', ib_grades_str)  # Keep only digits, commas, spaces
+        grades = [int(g.strip()) for g in re.split(r'[,\s]+', grades_str) if g.strip().isdigit()]
+        
+        if not grades:
+            return 2.0
+        
+        # Convert each grade to GPA and calculate average
+        gpa_values = [IB_GRADE_TO_GPA.get(grade, 1.0) for grade in grades if 1 <= grade <= 7]
+        
+        if not gpa_values:
+            return 2.0
+            
+        return round(sum(gpa_values) / len(gpa_values), 2)
+    except:
+        return 2.0
 
 def convert_alevel_to_gpa(grades: str) -> float:
-    """Convert A-level grades to approximate GPA"""
-    # Normalize and sort grades
-    grades_clean = re.sub(r'[^A*BCDE]', '', grades.upper().replace('A*', 'Z'))  # Use Z as temp for A*
-    grades_clean = grades_clean.replace('Z', 'A*')
-    
-    # Try exact match first
-    for pattern, gpa in ALEVEL_TO_GPA.items():
-        if ''.join(sorted(grades_clean)) == ''.join(sorted(pattern)):
-            return gpa
-    
-    # Calculate based on individual grade points
+    """Convert A-level grades to GPA using standard conversion"""
     grade_list = tokenise(grades)
     if not grade_list:
         return 2.0
     
-    total_points = sum(GRADE_POINTS.get(g, 0) for g in grade_list[:3])  # Top 3 grades
-    max_possible = 3 * 56  # A*A*A* = 168 points
+    # Convert each grade to GPA value and calculate average
+    gpa_values = [ALEVEL_GPA_VALUES.get(grade, 0.0) for grade in grade_list]
     
-    # Map to 4.0 scale
-    return max(2.0, min(4.0, (total_points / max_possible) * 4.0))
+    if not gpa_values:
+        return 2.0
+        
+    return round(sum(gpa_values) / len(gpa_values), 2)
 
 def get_student_gpa(grade_type: str, grades_input: str, gpa_input: float) -> Tuple[float, str]:
     """Get student's GPA and display string based on input type"""
     if grade_type == "IB":
-        try:
-            ib_score = int(grades_input)
-            converted_gpa = convert_ib_to_gpa(ib_score)
-            return converted_gpa, f"IB {ib_score} (≈{converted_gpa:.2f} GPA)"
-        except ValueError:
-            return gpa_input, f"GPA {gpa_input:.2f}"
+        converted_gpa = convert_ib_grades_to_gpa(grades_input)
+        return converted_gpa, f"IB grades {grades_input} (≈{converted_gpa:.2f} GPA)"
     elif grade_type == "A-level":
         converted_gpa = convert_alevel_to_gpa(grades_input)
         return converted_gpa, f"A-level {grades_input} (≈{converted_gpa:.2f} GPA)"
@@ -189,7 +184,7 @@ if grade_type == "A-level":
     stu_gr = st.text_input("Your A-level grades (e.g. A*A B)", "A*A B")
     stu_gpa = st.number_input("Your GPA (0-4 scale, optional - will convert from A-levels)", 0.0, 4.0, 0.0, 0.01)
 elif grade_type == "IB":
-    stu_gr = st.text_input("Your IB total score (out of 45)", "38")
+    stu_gr = st.text_input("Your IB subject grades (e.g. 7,6,5,6,7,4 or 7 6 5 6 7 4)", "7,6,5,6,7,4")
     stu_gpa = st.number_input("Your GPA (0-4 scale, optional - will convert from IB)", 0.0, 4.0, 0.0, 0.01)
 else:  # Direct GPA
     stu_gr = ""
